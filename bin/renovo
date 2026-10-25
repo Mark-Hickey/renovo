@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# renovo: tells a running Claude Code agent to reread its rule files when they change,
+# with no restart and no lost context.
+#
+#   renovo baseline   SessionStart hook: record what this session loaded
+#   renovo watch      Stop hook (asyncRewake): poll in the background; exit 2 on a change
+#   renovo status     which sessions are current and which are behind
+#   renovo prune      forget sessions not seen for RENOVO_PRUNE_DAYS
+#
+# Hook commands get the session JSON (session_id, cwd) on stdin.
+set -euo pipefail
+
+STATE=${RENOVO_STATE:-$HOME/.cache/renovo}
+HANDBOOK=${RENOVO_HANDBOOK:-}           # a shared rules folder: its AGENTS.md and sops/*.md
+INTERVAL=${RENOVO_INTERVAL:-30}        # seconds between checks
+MAX_RUN=${RENOVO_MAX_RUN:-86100}       # stop before the hook timeout (86400) kills us
+REARM=${RENOVO_REARM:-0}               # 1: wake once at MAX_RUN so the next Stop re-arms; 0: exit quietly
+PRUNE_DAYS=${RENOVO_PRUNE_DAYS:-7}
+DIFF_LINES=${RENOVO_DIFF_LINES:-40}         # most diff lines in one notice; the agent rereads the rest
+PERSONA_CMD=${RENOVO_PERSONA_CMD:-}     # optional: `<cmd> --resolve <cwd>` prints a persona file to watch
+
+# The files an agent loads as rules. Globs are expanded on every check, so a new SOP counts.
+# RENOVO_EXTRA adds more, colon separated.
+watched_files() {
+  local cwd=$1 p
+  local -a pats=(
+    "$HOME/.claude/CLAUDE.md"
+    "$cwd/CLAUDE.md"
+    "$cwd/AGENTS.md"
+    "$cwd/.agents/persona.md"
+    "$cwd/.agents/personas/*.md"
+  )
+  if [[ -n $HANDBOOK ]]; then
+    pats+=("$HANDBOOK/AGENTS.md" "$HANDBOOK/sops/*.md")
+  fi
+  # A persona that lives outside the project folder, named by a resolver command.
+  if [[ -n $PERSONA_CMD && -x $PERSONA_CMD ]] && p=$("$PERSONA_CMD" --resolve "$cwd" 2>/dev/null); then
+    pats+=("$p")
+  fi
+  if [[ -n ${RENOVO_EXTRA:-} ]]; then
+    IFS=: read -ra extra <<<"$RENOVO_EXTRA"
+    pats+=("${extra[@]}")
+  fi
+  shopt -s nullglob
+  for p in "${pats[@]}"; do
+    # shellcheck disable=SC2086
+    for f in $p; do [[ -f $f ]] && printf '%s\n' "$f"; done
+  done | sort -u
+}
+
+# "<sha256>  <path>" per file, sorted by path.
+fingerprint() {
+  local files
+  files=$(watched_files "$1")
+  [[ -z $files ]] && return 0
+  tr '\n' '\0' <<<"$files" | xargs -0 sha256sum | sort -k2
+}
+
+version_of() { sha256sum <"$1" | cut -c1-12; }
+
+read_hook_input() {
+  local input
+  input=$(cat)
+  SID=$(jq -r '.session_id // empty' <<<"$input")
+  CWD=$(jq -r '.cwd // empty' <<<"$input")
+  TRANSCRIPT=$(jq -r '.transcript_path // empty' <<<"$input")
+  [[ -n $SID ]] || { echo "renovo: no session_id on stdin" >&2; exit 1; }
+  [[ -n $CWD ]] || CWD=$PWD
+  DIR=$STATE/sessions/$SID
+  mkdir -p "$DIR"
+}
+
+# Record the fingerprint this session now has, and when. A copy of each file, named by its
+# sha256, lets the next notice show what changed.
+record() {
+  local sha path
+  fingerprint "$CWD" >"$DIR/files"
+  printf 'cwd\t%s\nversion\t%s\nsince\t%s\n' "$CWD" "$(version_of "$DIR/files")" "$(date -u +%FT%TZ)" >"$DIR/info"
+  rm -rf "$DIR/snap"
+  mkdir -p "$DIR/snap"
+  while read -r sha path; do cp "$path" "$DIR/snap/$sha" 2>/dev/null || true; done <"$DIR/files"
+}
+
+# A unified diff of each changed file against its copy, at most DIFF_LINES lines in all.
+show_changes() {
+  local old=$1 new=$2 sha path prev
+  while read -r sha path; do
+    prev=$(awk -v p="$path" '$2==p{print $1}' "$old")
+    [[ -n $prev && $prev != "$sha" && -f $DIR/snap/$prev ]] || continue
+    diff -u --label "$path (before)" --label "$path (now)" "$DIR/snap/$prev" "$path" || true
+  done <"$new" | head -n "$DIFF_LINES"
+}
+
+# The changed and added files, which the agent must reread, one per line.
+to_reread() { describe_diff "$1" "$2" | awk '$1=="changed:"||$1=="added:"{print $2}'; }
+
+# After a notice, a session is "told" until its transcript shows a Read of every file named.
+# Each Stop (the end of a turn) checks again; then the session is "confirmed".
+check_confirmed() {
+  local at f read_paths
+  [[ -f $DIR/told && ! -f $DIR/confirmed && -f $TRANSCRIPT ]] || return 0
+  at=$(awk -F'\t' '$1=="at"{print $2}' "$DIR/told")
+  read_paths=$(jq -rR --arg since "$at" 'fromjson? | select((.timestamp // "")[0:19] >= $since[0:19])
+    | .message.content[]? | select(.type? == "tool_use" and .name == "Read") | .input.file_path' "$TRANSCRIPT" | sort -u)
+  while read -r f; do
+    [[ -z $f ]] && continue
+    grep -qxF "$f" <<<"$read_paths" || return 0
+  done < <(awk -F'\t' '$1=="file"{print $2}' "$DIR/told")
+  date -u +%FT%TZ >"$DIR/confirmed"
+}
+
+# changed/added/removed lines between two fingerprint files.
+describe_diff() {
+  join -t$'\t' -j2 -a1 -a2 -e '-' -o '0,1.1,2.1' \
+    <(awk '{print $1"\t"$2}' "$1" | sort -t$'\t' -k2) \
+    <(awk '{print $1"\t"$2}' "$2" | sort -t$'\t' -k2) |
+    awk -F'\t' '$2=="-"{print "  added:   "$1; next} $3=="-"{print "  removed: "$1; next} $2!=$3{print "  changed: "$1}'
+}
+
+cmd_baseline() {
+  read_hook_input
+  record
+}
+
+cmd_watch() {
+  read_hook_input
+  # A turn just ended: did it reread what the last notice named? Runs even when a watcher is up.
+  check_confirmed
+  # One watcher per session: the lock is held for the life of this process.
+  exec 9>"$DIR/lock"
+  flock -n 9 || exit 0
+  [[ -f $DIR/files ]] || record
+
+  local start now cur
+  start=$(date +%s)
+  cur=$(mktemp)
+  trap 'rm -f "$cur"' EXIT
+  while :; do
+    sleep "$INTERVAL"
+    fingerprint "$CWD" >"$cur"
+    if ! cmp -s "$cur" "$DIR/files"; then
+      local diff changes f
+      diff=$(describe_diff "$DIR/files" "$cur")
+      changes=$(show_changes "$DIR/files" "$cur")
+      { printf 'version\t%s\nat\t%s\n' "$(version_of "$cur")" "$(date -u +%FT%TZ)"
+        to_reread "$DIR/files" "$cur" | while read -r f; do printf 'file\t%s\n' "$f"; done
+      } >"$DIR/told"
+      rm -f "$DIR/confirmed"
+      record
+      cat <<EOF
+Your rule files changed since you loaded them (renovo). Finish the step you are on, then
+reread each changed or added file in full with the Read tool and follow the new version.
+Do not restart the session.
+$diff
+${changes:+
+What changed (first $DIFF_LINES lines):
+$changes}
+EOF
+      exit 2
+    fi
+    now=$(date +%s)
+    if (( now - start >= MAX_RUN )); then
+      [[ $REARM == 1 ]] || exit 0
+      echo "renovo: no rule changes. This wake only re-arms the watcher; reply with one word and stop."
+      exit 2
+    fi
+  done
+}
+
+cmd_status() {
+  local d sid cwd ver since cur_ver watcher state tmp
+  [[ -d $STATE/sessions ]] || { echo "no sessions"; return; }
+  tmp=$(mktemp)
+  trap 'rm -f "$tmp"' RETURN
+  printf '%-38s %-8s %-12s %-9s %-20s %s\n' SESSION STATE VERSION WATCHER SINCE CWD
+  for d in "$STATE"/sessions/*/; do
+    [[ -f $d/info ]] || continue
+    sid=$(basename "$d")
+    cwd=$(awk -F'\t' '$1=="cwd"{print $2}' "$d/info")
+    ver=$(awk -F'\t' '$1=="version"{print $2}' "$d/info")
+    since=$(awk -F'\t' '$1=="since"{print $2}' "$d/info")
+    fingerprint "$cwd" >"$tmp"
+    cur_ver=$(version_of "$tmp")
+    if flock -n "$d/lock" true 2>/dev/null; then watcher=off; else watcher=running; fi
+    # current: on the latest rules and reread them. told: woken, but no Read of them seen yet.
+    if [[ $ver != "$cur_ver" ]]; then state=BEHIND
+    elif [[ -f $d/told && ! -f $d/confirmed ]]; then state=told
+    else state=current; fi
+    printf '%-38s %-8s %-12s %-9s %-20s %s\n' "$sid" "$state" "$ver" "$watcher" "$since" "$cwd"
+  done
+}
+
+cmd_prune() {
+  [[ -d $STATE/sessions ]] || return 0
+  find "$STATE/sessions" -mindepth 1 -maxdepth 1 -type d -mtime +"$PRUNE_DAYS" -print -exec rm -rf {} +
+}
+
+case ${1:-} in
+  baseline) cmd_baseline ;;
+  watch) cmd_watch ;;
+  status) cmd_status ;;
+  prune) cmd_prune ;;
+  *) echo "usage: renovo baseline|watch|status|prune" >&2; exit 64 ;;
+esac
