@@ -4,6 +4,14 @@ Tells a running Claude Code agent to reread its rule files when they change. The
 restart and does not lose context. It also records which version of the rules each session has,
 and whether the agent reread them, so you can see which agents are current and which are behind.
 
+## Why
+
+An agent reads its rule files (`CLAUDE.md`, `AGENTS.md` and others) one time, when its session
+starts. If a rule changes later, a running agent continues to follow the old version until
+someone restarts it. A restart loses the agent's context, and with many agents it takes a long
+time. renovo gives each running agent the change instead, so it follows the new rule within a
+minute and keeps its work.
+
 The design: at the end of a turn, start one background watcher if none runs. When the watcher
 finds a change, it returns and alerts Claude. Because it runs in the background, it also reaches
 idle agents.
@@ -19,6 +27,23 @@ idle agents.
    what changed (at most 40 lines), then exits with code 2. Claude Code then wakes the agent, even
    an idle one, with that text as a system reminder. The agent finishes its current step and
    rereads the files. The next Stop starts a new watcher.
+
+   The agent sees a note like this:
+
+   ```
+   Your rule files changed since you loaded them (renovo). Finish the step you are on, then
+   reread each changed or added file in full with the Read tool and follow the new version.
+   Do not restart the session.
+     changed: ~/rules/style.md
+
+   What changed (first 40 lines):
+   --- ~/rules/style.md (before)
+   +++ ~/rules/style.md (now)
+   @@ -1 +1,2 @@
+    Say hello.
+   +Sign off with a thumbs up.
+   ```
+
 4. **Confirmation.** After a notice, the session is `told`. At each Stop, renovo reads the
    session's transcript. When it shows a `Read` of every changed or added file since the notice,
    the session is `current` again. So `current` means "reread", not only "was told".
