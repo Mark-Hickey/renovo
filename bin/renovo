@@ -11,15 +11,13 @@
 set -euo pipefail
 
 STATE=${RENOVO_STATE:-$HOME/.cache/renovo}
-HANDBOOK=${RENOVO_HANDBOOK:-}           # a shared rules folder: its AGENTS.md and sops/*.md
 INTERVAL=${RENOVO_INTERVAL:-30}        # seconds between checks
 MAX_RUN=${RENOVO_MAX_RUN:-86100}       # stop before the hook timeout (86400) kills us
 REARM=${RENOVO_REARM:-0}               # 1: wake once at MAX_RUN so the next Stop re-arms; 0: exit quietly
 PRUNE_DAYS=${RENOVO_PRUNE_DAYS:-7}
 DIFF_LINES=${RENOVO_DIFF_LINES:-40}         # most diff lines in one notice; the agent rereads the rest
-PERSONA_CMD=${RENOVO_PERSONA_CMD:-}     # optional: `<cmd> --resolve <cwd>` prints a persona file to watch
 
-# The files an agent loads as rules. Globs are expanded on every check, so a new SOP counts.
+# The files an agent loads as rules. Globs are expanded on every check, so a new rule file counts.
 # RENOVO_EXTRA adds more, colon separated.
 watched_files() {
   local cwd=$1 p
@@ -27,16 +25,7 @@ watched_files() {
     "$HOME/.claude/CLAUDE.md"
     "$cwd/CLAUDE.md"
     "$cwd/AGENTS.md"
-    "$cwd/.agents/persona.md"
-    "$cwd/.agents/personas/*.md"
   )
-  if [[ -n $HANDBOOK ]]; then
-    pats+=("$HANDBOOK/AGENTS.md" "$HANDBOOK/sops/*.md")
-  fi
-  # A persona that lives outside the project folder, named by a resolver command.
-  if [[ -n $PERSONA_CMD && -x $PERSONA_CMD ]] && p=$("$PERSONA_CMD" --resolve "$cwd" 2>/dev/null); then
-    pats+=("$p")
-  fi
   if [[ -n ${RENOVO_EXTRA:-} ]]; then
     IFS=: read -ra extra <<<"$RENOVO_EXTRA"
     pats+=("${extra[@]}")

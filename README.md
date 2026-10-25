@@ -27,12 +27,10 @@ idle agents.
 
 - `~/.claude/CLAUDE.md`
 - `<cwd>/CLAUDE.md`, `<cwd>/AGENTS.md`
-- Personas: `<cwd>/.agents/persona.md` and `<cwd>/.agents/personas/*.md`
-- If `RENOVO_HANDBOOK` is set, a shared rules folder: its `AGENTS.md` and `sops/*.md`
-- If `RENOVO_PERSONA_CMD` is set, the persona file that `<cmd> --resolve <cwd>` prints
-- Any other globs in `RENOVO_EXTRA`, separated by colons
+- Any other globs in `RENOVO_EXTRA`, separated by colons, for example a shared rules folder:
+  `RENOVO_EXTRA='~/rules/*.md:~/rules/team/*.md'`
 
-The globs are expanded on every check, so a new SOP counts as a change. A file that does not
+The globs are expanded on every check, so a new rule file counts as a change. A file that does not
 exist is skipped.
 
 ### The timeout
@@ -75,9 +73,7 @@ The demo uses its own file, so no real rule changes and no real agent is affecte
 | `RENOVO_MAX_RUN` | `86100` seconds; keep it below the hook `timeout` |
 | `RENOVO_REARM` | `0` (off) |
 | `RENOVO_DIFF_LINES` | `40` lines of diff in a notice |
-| `RENOVO_HANDBOOK` | none |
 | `RENOVO_STATE` | `~/.cache/renovo` |
-| `RENOVO_PERSONA_CMD` | none |
 | `RENOVO_EXTRA` | none |
 
 ## Not done yet
@@ -90,4 +86,4 @@ The demo uses its own file, so no real rule changes and no real agent is affecte
   that is on GitHub but not pulled yet is not seen.
 - **One machine.** `renovo status` shows the sessions on this machine only.
 - **The restart fallback.** Changes that load only at startup (tools, MCP servers, launch
-  settings) still need a restart that an operator approves. renovo does not detect or request it.
+  settings) still need a restart that a person approves. renovo does not detect or request it.
